@@ -1,0 +1,86 @@
+# TEMPLATE. Fill every {{...}} token; leave ${{ ... }} (leading $) alone.
+#
+# Merges green [loop] PRs between runner wakes.
+#
+# Companion to loop-runner.yml: the runner only merges during a wake, so a
+# PR whose required check goes green after the wake ends strands until the
+# next wake. This workflow applies the runner's exact merge rule (open,
+# non-draft, `loop` label, `loop/*` branch, required checks green) as soon
+# as CI completes, plus an hourly sweep for checks that settle out-of-band.
+#
+# One guard the runner cannot enforce (its .loop/state.json snapshot only
+# sees {{REQUIRED_CHECK}}): PRs touching {{UNCOVERED_PATHS}} additionally
+# need {{UNCOVERED_CHECK_DESC}} green — the required check does not fully
+# cover those paths, and a breakage there once shipped past a green check.
+# Delete the guard block if every path is CI-covered.
+name: Loop merge on green
+
+on:
+  workflow_run:
+    workflows: [{{CI_WORKFLOW_NAME}}]
+    types: [completed]
+  schedule:
+    - cron: "45 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  statuses: read
+
+concurrency:
+  group: loop-merge-green
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    # workflow_run: only act on successful PR-triggered CI runs.
+    # schedule / workflow_dispatch: always sweep.
+    if: github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge green loop PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          # NOTE: `gh pr checks` / GraphQL statusCheckRollup are unusable here —
+          # the default Actions token gets "Resource not accessible by
+          # integration" when the rollup contains other apps' check suites
+          # (Vercel, GitGuardian, ...). Use REST, same as loop-runner.yml.
+          prs=$(gh pr list --repo "$REPO" --label loop --state open \
+            --json number,isDraft,headRefName \
+            --jq '.[] | select(.isDraft | not) | select(.headRefName | startswith("loop/")) | .number')
+          if [ -z "$prs" ]; then
+            echo "No candidate loop PRs."
+            exit 0
+          fi
+          for n in $prs; do
+            echo "--- PR #$n"
+            sha=$(gh pr view "$n" --repo "$REPO" --json headRefOid --jq .headRefOid)
+            # The branch-protection-required check, via REST.
+            concl=$(gh api "repos/$REPO/commits/$sha/check-runs?check_name={{REQUIRED_CHECK}}" \
+              --jq '[.check_runs[] | select(.status == "completed")] | sort_by(.started_at) | last | .conclusion // "missing"' 2>/dev/null || echo "api_error")
+            if [ "$concl" != "success" ]; then
+              echo "{{REQUIRED_CHECK}} is '$concl' — skipping #$n."
+              continue
+            fi
+            # {{UNCOVERED_PATHS}} guard: also require the external commit status green.
+            if gh pr diff "$n" --repo "$REPO" --name-only | grep -q '^{{UNCOVERED_PATHS_GREP}}'; then
+              extra=$(gh api "repos/$REPO/commits/$sha/status" \
+                --jq '[.statuses[] | select(.context | test("{{UNCOVERED_STATUS_REGEX}}"; "i")) | .state] | if length == 0 then "missing" elif all(. == "success") then "success" else "not_green" end' 2>/dev/null || echo "api_error")
+              if [ "$extra" != "success" ]; then
+                echo "Touches {{UNCOVERED_PATHS}} but extra status is '$extra' — skipping #$n."
+                continue
+              fi
+            fi
+            if gh pr merge "$n" --repo "$REPO" --squash --delete-branch; then
+              echo "Merged #$n."
+            else
+              # Conflict or protection race — the runner's next wake handles it
+              # via its existing fix/discard protocol.
+              echo "Merge failed for #$n — leaving it for the runner."
+            fi
+          done

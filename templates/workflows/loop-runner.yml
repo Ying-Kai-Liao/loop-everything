@@ -1,0 +1,171 @@
+# TEMPLATE. Fill every {{...}} token; leave GitHub's ${{ ... }} expressions
+# (leading $) alone. Generalized from Nina's loop-runner.yml.
+name: loop-runner
+
+# Self-waking build loop: works one iteration of loops/README.md per wake.
+# Human steering: GitHub issues labeled `loop` (see loops/runner/cloud-runner-prompt.md).
+# Kill switch: gh variable set LOOP_RUNNER_ENABLED --body false
+
+on:
+  schedule:
+    # Pick a cadence; GitHub schedules fire best-effort (often 1-3h late —
+    # that's normal, not a failure). Nina runs five wakes/day:
+    - cron: "17 */5 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: loop-runner
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+  checks: read
+  id-token: write
+
+jobs:
+  iterate:
+    if: ${{ vars.LOOP_RUNNER_ENABLED != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ---- {{SETUP_STEPS}}: toolchain setup + dependency install + any
+      # build the verifiers need before the agent runs. Nina example:
+      #   pnpm/action-setup + setup-node(cache: pnpm)
+      #   pnpm install --frozen-lockfile
+      #   pnpm --filter @scope/shared build   (verifier prereq)
+      # The agent's sandbox has NO network — everything it needs to build
+      # and test must be installed here.
+
+      # The agent's GitHub App token cannot read checks/Actions state.
+      # Snapshot everything it needs for routing here, with the workflow
+      # token. REST only — GraphQL statusCheckRollup fails on check runs
+      # owned by other apps (Vercel/GitGuardian etc.):
+      # "not accessible by integration".
+      - name: Snapshot in-flight loop state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p .loop
+          REPO="${{ github.repository }}"
+          gh pr list --state open --label loop --json number,title,headRefName,headRefOid,isDraft > .loop/prs.json
+          echo "[]" > .loop/state.json
+          for n in $(jq -r '.[].number' .loop/prs.json); do
+            sha=$(jq -r ".[] | select(.number==$n) | .headRefOid" .loop/prs.json)
+            branch=$(jq -r ".[] | select(.number==$n) | .headRefName" .loop/prs.json)
+            isdraft=$(jq -r ".[] | select(.number==$n) | .isDraft" .loop/prs.json)
+            title=$(jq -r ".[] | select(.number==$n) | .title" .loop/prs.json)
+            # Wait (bounded ~10 min) for the required check to settle.
+            concl="pending"
+            for i in $(seq 1 20); do
+              concl=$(gh api "/repos/$REPO/commits/$sha/check-runs?check_name={{REQUIRED_CHECK}}" \
+                --jq 'if (.check_runs|length)==0 then "none" elif .check_runs[0].status=="completed" then .check_runs[0].conclusion else "pending" end' \
+                2>/dev/null || echo "none")
+              [ "$concl" != "pending" ] && break
+              sleep 30
+            done
+            jq --argjson n "$n" --arg t "$title" --arg b "$branch" --argjson d "$isdraft" --arg v "$concl" \
+               '. += [{number:$n,title:$t,headRefName:$b,isDraft:$d,{{REQUIRED_CHECK}}:$v}]' \
+               .loop/state.json > .loop/tmp.json && mv .loop/tmp.json .loop/state.json
+            if [ "$concl" = "failure" ]; then
+              rid=$(gh run list --branch "$branch" --workflow {{CI_WORKFLOW_NAME}} --limit 1 --json databaseId --jq '.[0].databaseId' || true)
+              [ -n "$rid" ] && gh run view "$rid" --log-failed 2>/dev/null | tail -200 > ".loop/failed-$n.log" || true
+              gh pr view "$n" --json commits --jq '[.commits[].messageHeadline] | map(select(startswith("loop: fix pass"))) | length' > ".loop/fixpasses-$n" || echo 0 > ".loop/fixpasses-$n"
+            fi
+          done
+          cat .loop/state.json
+
+      - name: Run one loop iteration
+        id: agent
+        uses: anthropics/claude-code-action@v1
+        with:
+          # Subscription auth (preferred): `claude setup-token` → CLAUDE_CODE_OAUTH_TOKEN secret.
+          # API-key auth is the fallback; the action uses whichever is set.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            Read loops/runner/cloud-runner-prompt.md and execute exactly one
+            wake of the {{PROJECT_NAME}} cloud build loop as specified there.
+          claude_args: |
+            --model opus
+            --max-turns 120
+            --allowedTools "Read,Glob,Grep,Edit,Write,TodoWrite,Task,{{BUILD_TOOL_ALLOWLIST}},Bash(git status),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git add:*),Bash(git commit:*),Bash(git checkout:*),Bash(git branch:*),Bash(git fetch:*),Bash(git rev-parse:*),Bash(git push origin loop/*),Bash(gh pr list:*),Bash(gh pr view:*),Bash(gh pr create:*),Bash(gh pr comment:*),Bash(gh pr merge:*),Bash(gh pr close:*),Bash(gh pr checks:*),Bash(gh pr ready:*),Bash(gh run list:*),Bash(gh run view:*),Bash(gh issue list:*),Bash(gh issue view:*),Bash(gh issue comment:*),Bash(gh issue edit:*),Bash(gh issue create:*),Bash(gh label list:*)"
+            # {{BUILD_TOOL_ALLOWLIST}} example (Nina):
+            # Bash(pnpm install:*),Bash(pnpm --filter:*),Bash(node:*)
+            # Note: the sandbox blocks shell rm/mv/cp/redirects even inside
+            # the repo — agents use `node -e` (fs.rmSync etc.) for file ops,
+            # so include a node entry.
+
+      # "The agent's done is a claim, not a fact." Verify the sentinel's
+      # claim against GitHub state; fail the run on a lie or a missing report.
+      - name: Untrusted completion check
+        if: always() && steps.agent.outputs.execution_file != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          EXEC_FILE="${{ steps.agent.outputs.execution_file }}"
+          SENTINEL=$(grep -o '<loop-result>[^<]*</loop-result>' "$EXEC_FILE" | tail -1 || true)
+          echo "sentinel: ${SENTINEL:-none}"
+          if [ -z "$SENTINEL" ]; then
+            echo "::error::Agent finished without a <loop-result> sentinel"
+            exit 1
+          fi
+          case "$SENTINEL" in
+            *PR_OPENED*|*PR_MERGED*|*FIX_PUSHED*|*DISCARDED*|*HANDOFF*)
+              NUM=$(echo "$SENTINEL" | grep -o '#[0-9]*' | tr -d '#' || true)
+              if [ -z "$NUM" ] || ! gh pr view "$NUM" --json number >/dev/null 2>&1; then
+                echo "::error::Sentinel claims PR activity on #$NUM but that PR does not exist"
+                exit 1
+              fi
+              if echo "$SENTINEL" | grep -q PR_MERGED; then
+                STATE=$(gh pr view "$NUM" --json state --jq .state)
+                if [ "$STATE" != "MERGED" ]; then
+                  echo "::error::Sentinel claims PR #$NUM merged but state is $STATE"
+                  exit 1
+                fi
+              fi
+              ;;
+            *NOOP*|*BLOCKED*)
+              ;;
+          esac
+
+      - name: Wake summary (manager view)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          EXEC_FILE="${{ steps.agent.outputs.execution_file }}"
+          SENTINEL=$(grep -o '<loop-result>[^<]*</loop-result>' "$EXEC_FILE" 2>/dev/null | tail -1 || true)
+          {
+            echo "## Loop wake — $(date -u '+%F %R UTC')"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Sentinel | \`${SENTINEL:-none}\` |"
+            echo "| Open loop PRs | $(gh pr list --state open --label loop --json number --jq length) |"
+            echo "| Open loop issues | $(gh issue list --state open --label loop --json number --jq length) |"
+            echo ""
+            echo "Work: [loop PRs](https://github.com/${{ github.repository }}/pulls?q=is%3Apr+label%3Aloop) · [loop issues](https://github.com/${{ github.repository }}/issues?q=is%3Aissue+label%3Aloop) · journal: \`loops/journal/\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report failed wake as issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TITLE="loop-runner failed $(date -u +%F)"
+          EXISTING=$(gh issue list --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number' || true)
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+            gh issue comment "$EXISTING" --body "@{{OWNER_HANDLE}} another failed wake: $RUN_URL"
+          else
+            gh issue create --title "$TITLE" --label loop-ops \
+              --body "@{{OWNER_HANDLE}} a loop-runner wake failed. Logs: $RUN_URL"
+          fi
