@@ -51,3 +51,10 @@ templates/
 
 Every `{{PLACEHOLDER}}` token in `templates/` gets filled per-repo during
 bootstrap; GitHub's own `${{ ... }}` expressions are left alone.
+
+## v2 (proposed)
+
+`docs/DESIGN-v2-hub-and-spoke.md` — hub-and-spoke, ticket-first: reusable
+workflows in this repo, per-repo facts in `loops/loop.yml`, harness-side
+work assignment, minute-scale intake, three-label interrupt model, one
+cross-repo inbox. Nina is the first consumer.
