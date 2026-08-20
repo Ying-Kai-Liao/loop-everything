@@ -1,0 +1,22 @@
+# Spoke caller for the loop-everything v2 hub merge-on-green sweep. Copy
+# to the spoke repo as .github/workflows/loop-merge.yml.
+# Phase 0 triggers: schedule sweep + manual dispatch only (an on-green
+# workflow_run trigger is a later phase). Requires the LOOP_MERGE_PAT
+# secret — see the token comment in the hub's loop-merge-green.yml.
+name: loop-merge
+on:
+  schedule:
+    - cron: "45 */6 * * *"   # sweep; each run bills >=1 runner-minute
+  workflow_dispatch: {}
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  statuses: read
+concurrency: { group: loop-merge-green, cancel-in-progress: false }
+jobs:
+  merge:
+    uses: Ying-Kai-Liao/loop-everything/.github/workflows/loop-merge-green.yml@v2
+    with:
+      hub_ref: v2
+    secrets: inherit
