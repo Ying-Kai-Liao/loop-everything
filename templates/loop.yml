@@ -1,0 +1,58 @@
+# loops/loop.yml — this repo's facts for the loop-everything v2 runner.
+# The hub prompt (.loop/hub/runner/wake.md) reads this file every wake;
+# schema/loop.schema.json in the hub validates it.
+#
+# This copy carries Nina's facts — the first spoke, extracted verbatim from
+# the v1 prompt/workflow it replaces. A new spoke edits every value.
+
+version: 2
+human: "@Ying-Kai-Liao"          # @mentions notify; labels don't
+required_check: validate         # branch-protection check the harness snapshots
+branch_prefix: "loop/"           # agent push permission is scoped to this prefix
+model: claude-sonnet-4-6
+max_turns: 150
+lanes: { default: 2, max: 4 }    # night cadence runs 2 lanes (LOOP_NIGHT_LANES default)
+
+# Verifier ladder — the command that proves each level (see loops/VERIFIERS.md).
+verify:
+  L0: "pnpm --filter @nina/shared build && pnpm --filter @nina/db build"
+  L1: "pnpm --filter <pkg> test"
+
+# Units likely to touch these are lane-0-only, one at a time — two open PRs
+# touching either is a known merge-conflict shape.
+serial_paths:
+  - "packages/db/drizzle/**"
+  - "worker/bot-template/VERSION"
+
+# CI passes without proving these areas, so an extra commit status must be
+# green before merge. `validate` typechecks but does not build web/ (the
+# #191/#195 gap); the merge-green workflow waits for the Vercel status.
+blind_spots:
+  - paths: ["web/**"]
+    require_status: vercel
+
+# Injected verbatim into the wake prompt — one load-bearing rule per line,
+# with the incident that earned it.
+invariants:
+  - "Any change under worker/bot-template/** MUST bump worker/bot-template/VERSION (semver patch) — rollout keys on this version; without the bump the change publishes but no deployed tenant VM ever receives it (#187)."
+  - "After any packages/db schema.ts change run `pnpm db:generate` and commit the .sql + meta/ snapshot + _journal.json together (#259) — drizzle-kit baselines off the highest snapshot and the drift guard in schema.test.ts fails otherwise. DATA-only migrations are the exception: hand-add the .sql + a _journal.json entry with a fresh `when` and NO snapshot (#422)."
+  - "worker/bot-template is a standalone vendored package, NOT a pnpm workspace member — `pnpm --filter worker` never reaches it; its node:test suite is CI-gated by the dedicated 'Test bot-template' step (#164), so cite the PR's validate result as its L1 evidence instead of fighting the no-network sandbox."
+  - "Registry loops maintain an OpenSpec change dir (openspec/changes/<name>/, copy the structure of existing changes); archive it only on a wake AFTER the merge proved out, never in the wake that marked the loop done."
+
+network: github                  # sandbox allows GitHub API, denies the open web
+
+escalation: { agent: smart, label: opus }   # .claude/agents/smart.md, pinned to Opus
+
+# Appended to the runner's base allowedTools list (repo build/test tooling).
+allowed_tools_extra:
+  - "Bash(pnpm install:*)"
+  - "Bash(pnpm --filter:*)"
+  - "Bash(pnpm db:generate)"
+  - "Bash(node:*)"
+
+# Shell commands the harness runs before the agent starts (verifier prereqs).
+setup:
+  - "pnpm install --frozen-lockfile"
+  - "pnpm --filter @nina/shared build && pnpm --filter @nina/db build"
+
+registry: loops/README.md        # roadmap-driven repo; omit for ticket-only repos
