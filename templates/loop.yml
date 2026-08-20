@@ -52,6 +52,13 @@ allowed_tools_extra:
 
 # Shell commands the harness runs before the agent starts (verifier prereqs).
 setup:
+  # v2 has no pnpm/action-setup step (v1 needed its `dest:` fix for the
+  # two-lane ENOTEMPTY race — gone entirely here): the self-hosted box
+  # provides node + a global pnpm. Expose it to this job's later steps
+  # AND the agent's shell via GITHUB_PATH; guard so a hosted fallback
+  # runner still works.
+  - "command -v pnpm >/dev/null 2>&1 || npm install -g pnpm@10.30.1"
+  - "dirname \"$(command -v pnpm)\" >> \"$GITHUB_PATH\""
   - "pnpm install --frozen-lockfile"
   - "pnpm --filter @nina/shared build && pnpm --filter @nina/db build"
 
