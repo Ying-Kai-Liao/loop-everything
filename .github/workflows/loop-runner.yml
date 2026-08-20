@@ -1,0 +1,226 @@
+name: loop-runner
+
+# Reusable (workflow_call) self-waking build loop — the loop-everything v2
+# hub port of Nina's loop-runner.yml. A spoke repo calls this from a
+# ~25-line caller (templates/spoke/loop-caller.yml); all per-repo facts
+# come from the spoke's loops/loop.yml (schema/loop.schema.json).
+#
+# Runtime layout: the SPOKE repo is checked out at the workspace root and
+# the HUB repo is checked out at .loop/hub/ pinned to `hub_ref`, so the
+# prompt is .loop/hub/runner/wake.md, settings .loop/hub/runner/
+# claude-settings.json, and scripts .loop/hub/scripts/*.sh. Runtime state
+# stays in .loop/ and is never committed.
+#
+# Kill switch (spoke repo): gh variable set LOOP_RUNNER_ENABLED --body false
+# Cadence and lane count are a BILLING knob, not a correctness one — the
+# caller's cron and lanes input are the levers (Nina's 2026-08-17 audit:
+# halving lanes/day roughly halves total Actions spend).
+
+on:
+  workflow_call:
+    inputs:
+      lanes:
+        description: "Requested parallel lanes for this wake (clamped to loop.yml lanes.max; empty = loop.yml lanes.default)"
+        type: string
+        required: false
+        default: "1"
+      hub_ref:
+        description: "loop-everything ref to pin the hub checkout to (tag, branch, or SHA)"
+        type: string
+        required: false
+        default: "v2"
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: "Claude subscription OAuth token (`claude setup-token`)"
+        required: true
+
+jobs:
+  plan:
+    if: ${{ vars.LOOP_RUNNER_ENABLED != 'false' }}
+    # Stays GitHub-hosted on purpose: it is ~15s of shell, and keeping it off
+    # the self-hosted box means a wedged box shows up as a failed `iterate`
+    # rather than a wake that never reports at all.
+    runs-on: ubuntu-latest
+    outputs:
+      lanes: ${{ steps.decide.outputs.lanes }}
+      count: ${{ steps.decide.outputs.count }}
+    steps:
+      - name: Check out spoke repository
+        uses: actions/checkout@v4
+
+      - name: Check out hub
+        uses: actions/checkout@v4
+        with:
+          repository: Ying-Kai-Liao/loop-everything
+          ref: ${{ inputs.hub_ref }}
+          path: .loop/hub
+
+      - name: Validate loops/loop.yml
+        run: bash .loop/hub/scripts/validate-loop.sh loops/loop.yml .loop/hub/schema/loop.schema.json
+
+      - name: Decide lane count
+        id: decide
+        env:
+          REQUESTED: ${{ inputs.lanes }}
+        run: |
+          bash .loop/hub/scripts/loopcfg.sh loops/loop.yml > .loop/config.json
+          DEFAULT=$(jq -r '.lanes.default' .loop/config.json)
+          MAX=$(jq -r '.lanes.max' .loop/config.json)
+          N="${REQUESTED:-$DEFAULT}"
+          case "$N" in (*[!0-9]*|'') N="$DEFAULT" ;; esac
+          [ "$N" -lt 1 ] && N=1
+          [ "$N" -gt "$MAX" ] && N="$MAX"
+          LANES=$(seq 0 $((N - 1)) | jq -cs .)
+          echo "count=$N" >> "$GITHUB_OUTPUT"
+          echo "lanes=$LANES" >> "$GITHUB_OUTPUT"
+          echo "lanes=$LANES (requested: ${REQUESTED:-<default>}, max: $MAX)"
+
+  iterate:
+    needs: plan
+    # ROLLBACK VALVE (Nina 2026-08-18, self-hosted migration). RUNNER_LOOP is
+    # a SPOKE repo variable (caller vars resolve in called workflows). Unset
+    # falls back to GitHub-hosted:  gh variable delete RUNNER_LOOP
+    # Set with:                     gh variable set RUNNER_LOOP --body <label>
+    # Blast radius if the box is down: the loop pauses. Nothing is gated on it.
+    runs-on: ${{ vars.RUNNER_LOOP || 'ubuntu-latest' }}
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: ${{ fromJSON(needs.plan.outputs.lanes) }}
+    env:
+      LANE: ${{ matrix.lane }}
+    steps:
+      - name: Check out spoke repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check out hub
+        uses: actions/checkout@v4
+        with:
+          repository: Ying-Kai-Liao/loop-everything
+          ref: ${{ inputs.hub_ref }}
+          path: .loop/hub
+
+      - name: Load loop config
+        run: |
+          bash .loop/hub/scripts/loopcfg.sh loops/loop.yml > .loop/config.json
+          {
+            echo "LOOP_HUMAN=$(jq -r '.human' .loop/config.json)"
+            echo "LOOP_MODEL=$(jq -r '.model' .loop/config.json)"
+            echo "LOOP_MAX_TURNS=$(jq -r '.max_turns' .loop/config.json)"
+            echo "LOOP_REQUIRED_CHECK=$(jq -r '.required_check' .loop/config.json)"
+            echo "LOOP_BRANCH_PREFIX=$(jq -r '.branch_prefix' .loop/config.json)"
+          } >> "$GITHUB_ENV"
+          # allowedTools = hub base list + loop.yml allowed_tools_extra.
+          # Repo-specific build tools (Nina's pnpm entries) live in
+          # allowed_tools_extra, not here. The git push entry is scoped to
+          # the repo's branch_prefix.
+          PREFIX=$(jq -r '.branch_prefix' .loop/config.json)
+          BASE="Read,Glob,Grep,Edit,Write,TodoWrite,Task,Bash(node:*),Bash(git status),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git add:*),Bash(git commit:*),Bash(git checkout:*),Bash(git branch:*),Bash(git fetch:*),Bash(git rev-parse:*),Bash(git push origin ${PREFIX}*),Bash(gh pr list:*),Bash(gh pr view:*),Bash(gh pr create:*),Bash(gh pr comment:*),Bash(gh pr merge:*),Bash(gh pr close:*),Bash(gh pr checks:*),Bash(gh pr ready:*),Bash(gh run list:*),Bash(gh run view:*),Bash(gh issue list:*),Bash(gh issue view:*),Bash(gh issue comment:*),Bash(gh issue edit:*),Bash(gh issue create:*),Bash(gh label list:*)"
+          EXTRA=$(jq -r '.allowed_tools_extra | join(",")' .loop/config.json)
+          [ -n "$EXTRA" ] && BASE="$BASE,$EXTRA"
+          echo "LOOP_ALLOWED_TOOLS=$BASE" >> "$GITHUB_ENV"
+
+      # Repo-specific installs / prereq builds (e.g. Nina's pnpm install +
+      # shared package builds) come from loop.yml `setup:` — the runner's
+      # toolchain must already provide the tools those commands invoke.
+      - name: Run setup commands
+        run: |
+          jq -r '.setup[]?' .loop/config.json > .loop/setup.sh
+          if [ -s .loop/setup.sh ]; then
+            bash -e .loop/setup.sh
+          else
+            echo "No setup commands in loop.yml."
+          fi
+
+      # The agent's GitHub App token cannot read checks/Actions state.
+      # Snapshot everything it needs for routing with the workflow token.
+      - name: Snapshot in-flight loop state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REQUIRED_CHECK: ${{ env.LOOP_REQUIRED_CHECK }}
+        run: bash .loop/hub/scripts/snapshot-state.sh
+
+      # Skew lane starts: lane 0 gets a head start on §A bookkeeping, and
+      # lane claims land on issues before the next lane reads them.
+      - name: Stagger lane start
+        if: ${{ matrix.lane != 0 }}
+        run: sleep $(( LANE * 120 ))
+
+      - name: Run one loop iteration
+        id: agent
+        uses: anthropics/claude-code-action@v1
+        with:
+          # Subscription auth ONLY: `claude setup-token` → CLAUDE_CODE_OAUTH_TOKEN secret (1-year token).
+          # Do NOT also pass anthropic_api_key — Claude Code's auth precedence puts ANTHROPIC_API_KEY above the OAuth token, so passing both silently bills the metered API (that was Nina's Sonnet 5 spend, ~$30+/day).
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            Read .loop/hub/runner/wake.md and execute exactly one wake of
+            this repository's build loop as specified there. Repo facts
+            (verify ladder, invariants, serial paths) are in loops/loop.yml.
+            This wake runs ${{ needs.plan.outputs.count }} parallel lane(s);
+            you are lane ${{ matrix.lane }}, in run ${{ github.run_id }}
+            (${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+            Follow the prompt's "Parallel lanes" section for what your lane
+            may and may not do.
+          # Model policy: the main loop runs the loop.yml model; the hard 20%
+          # is delegated to the repo's escalation agent (loop.yml
+          # `escalation`, e.g. Nina's `smart` pinned to Opus) per the
+          # prompt's "Model policy" section — the escalation label forces
+          # that route.
+          # Runner-scoped hooks (.loop/hub/runner/claude-settings.json): a
+          # Stop hook that bounces a final message missing the <loop-result>
+          # sentinel, and a PostToolUse turn meter that warns before the
+          # turn cap so checkpoints happen before a cap death. Interactive
+          # sessions never load this file.
+          claude_args: |
+            --model ${{ env.LOOP_MODEL }}
+            --max-turns ${{ env.LOOP_MAX_TURNS }}
+            --settings .loop/hub/runner/claude-settings.json
+            --allowedTools "${{ env.LOOP_ALLOWED_TOOLS }}"
+
+      # "The agent's done is a claim, not a fact." Verify the sentinel's
+      # claim against GitHub state; fail the run on a lie or a missing report.
+      - name: Untrusted completion check
+        if: always() && steps.agent.outputs.execution_file != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: bash .loop/hub/scripts/verify-sentinel.sh "${{ steps.agent.outputs.execution_file }}"
+
+      - name: Wake summary (manager view)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          EXEC_FILE="${{ steps.agent.outputs.execution_file }}"
+          SENTINEL=$(grep -o '<loop-result>[^<]*</loop-result>' "$EXEC_FILE" 2>/dev/null | tail -1 || true)
+          {
+            echo "## Loop wake — lane ${LANE}/${{ needs.plan.outputs.count }} — $(date -u '+%F %R UTC')"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Sentinel | \`${SENTINEL:-none}\` |"
+            echo "| Open loop PRs | $(gh pr list --state open --label loop --json number --jq length) |"
+            echo "| Open loop issues | $(gh issue list --state open --label loop --json number --jq length) |"
+            echo ""
+            echo "Work: [loop PRs](https://github.com/${{ github.repository }}/pulls?q=is%3Apr+label%3Aloop) · [loop issues](https://github.com/${{ github.repository }}/issues?q=is%3Aissue+label%3Aloop) · journal: \`loops/journal/\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report failed wake as issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TITLE="loop-runner failed $(date -u +%F)"
+          EXISTING=$(gh issue list --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number' || true)
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+            gh issue comment "$EXISTING" --body "${LOOP_HUMAN:-} another failed wake (lane $LANE): $RUN_URL"
+          else
+            gh issue create --title "$TITLE" --label loop-ops \
+              --body "${LOOP_HUMAN:-} a loop-runner wake failed (lane $LANE). Logs: $RUN_URL"
+          fi

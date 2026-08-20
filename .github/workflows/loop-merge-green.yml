@@ -1,0 +1,86 @@
+name: loop-merge-green
+
+# Reusable (workflow_call) port of Nina's "Loop merge on green".
+#
+# Companion to loop-runner.yml: the runner only merges during a wake, so a
+# PR whose required check goes green after the wake ends strands until the
+# next wake. This workflow applies the runner's exact merge rule (open,
+# non-draft, `loop` label, branch under loop.yml branch_prefix, required
+# check green) whenever the caller fires it — for Phase 0 that is a
+# schedule sweep + workflow_dispatch (templates/spoke/loop-merge-caller.yml);
+# an on-green workflow_run trigger is a later caller addition, and the
+# `if` below already handles it.
+#
+# One guard the runner cannot enforce (its .loop/state.json snapshot only
+# sees the required check): loop.yml `blind_spots` maps path globs to a
+# required commit-status substring — e.g. Nina's web/** needs the Vercel
+# build status because `validate` typechecks web/ but does not build it,
+# and the #191/#195 incident shipped a web breakage past a green validate.
+
+on:
+  workflow_call:
+    inputs:
+      hub_ref:
+        description: "loop-everything ref to pin the hub checkout to (tag, branch, or SHA)"
+        type: string
+        required: false
+        default: "v2"
+    secrets:
+      LOOP_MERGE_PAT:
+        description: "Fine-grained PAT (Contents + Pull requests, read/write) whose pushes trigger workflows"
+        required: true
+
+jobs:
+  merge:
+    # workflow_run (if a caller adds it later): only act on successful
+    # PR-triggered CI runs. schedule / workflow_dispatch: always sweep.
+    if: github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request')
+    runs-on: ubuntu-latest
+    # Bounds a wedged sweep: a Nina 2026-08-06 scheduled run hung for ~16
+    # minutes on API calls before failing. The happy path takes well under
+    # a minute.
+    timeout-minutes: 10
+    steps:
+      # TOKEN CHOICE IS LOAD-BEARING (Nina #401). Merging with the default
+      # `github.token` produces a push to main that GitHub's anti-recursion
+      # rule suppresses: events created by GITHUB_TOKEN never start workflow
+      # runs, so any `on: push: main` deploy workflow silently never fires
+      # and every auto-merged loop PR lands on main undeployed. LOOP_MERGE_PAT
+      # is a fine-grained PAT (Contents + Pull requests, read/write) whose
+      # pushes trigger workflows normally. It is used ONLY for the merge —
+      # check/status reads stay on `github.token` because fine-grained PATs
+      # cannot call the Checks API at all (documented GitHub gap), and
+      # anti-recursion only affects writes. Do not swap the merge back to
+      # `github.token`, and fail loudly rather than fall back if the secret
+      # is missing or expired — stranded-but-visible beats
+      # merged-but-never-deployed.
+      - name: Require deploy-capable token
+        env:
+          LOOP_MERGE_PAT: ${{ secrets.LOOP_MERGE_PAT }}
+        run: |
+          if [ -z "$LOOP_MERGE_PAT" ]; then
+            echo "::error::LOOP_MERGE_PAT secret is missing (or empty). Refusing to merge with github.token — its pushes do not trigger on:push workflows, so merged loop PRs would never deploy (Nina #401). Provision the PAT in repo secrets."
+            exit 1
+          fi
+
+      - name: Check out spoke repository
+        uses: actions/checkout@v4
+
+      - name: Check out hub
+        uses: actions/checkout@v4
+        with:
+          repository: Ying-Kai-Liao/loop-everything
+          ref: ${{ inputs.hub_ref }}
+          path: .loop/hub
+
+      - name: Merge green loop PRs
+        env:
+          GH_TOKEN: ${{ secrets.LOOP_MERGE_PAT }}
+          READ_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          bash .loop/hub/scripts/loopcfg.sh loops/loop.yml > .loop/config.json
+          export REQUIRED_CHECK=$(jq -r '.required_check' .loop/config.json)
+          export BRANCH_PREFIX=$(jq -r '.branch_prefix' .loop/config.json)
+          export BLIND_SPOTS_JSON=$(jq -c '.blind_spots' .loop/config.json)
+          bash .loop/hub/scripts/merge-green.sh
