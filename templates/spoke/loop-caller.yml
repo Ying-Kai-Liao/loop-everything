@@ -1,0 +1,32 @@
+# Spoke caller for the loop-everything v2 hub runner. Copy to the spoke
+# repo as .github/workflows/loop.yml. All per-repo facts live in
+# loops/loop.yml — this file should never need editing after install.
+# Phase 0 triggers: schedule heartbeat + manual dispatch only.
+# Kill switch: gh variable set LOOP_RUNNER_ENABLED --body false
+name: loop
+on:
+  schedule:
+    - cron: "17 */6 * * *"   # heartbeat; cadence is a billing knob
+  workflow_dispatch:
+    inputs:
+      lanes:
+        description: "Parallel lanes for this wake (clamped to loop.yml lanes.max)"
+        required: false
+        default: "1"
+# Coalesces bursts: GitHub keeps 1 running + at most 1 pending per group.
+concurrency: { group: loop-runner, cancel-in-progress: false }
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+  checks: read
+  id-token: write
+jobs:
+  loop:
+    if: ${{ vars.LOOP_RUNNER_ENABLED != 'false' }}
+    uses: Ying-Kai-Liao/loop-everything/.github/workflows/loop-runner.yml@v2
+    with:
+      lanes: ${{ inputs.lanes || vars.LOOP_LANES || '1' }}
+      hub_ref: v2
+    secrets: inherit

@@ -1,0 +1,5 @@
+# Invalid: missing required_check (required by schema/loop.schema.json).
+version: 2
+human: "@Ying-Kai-Liao"
+verify:
+  L0: "true"

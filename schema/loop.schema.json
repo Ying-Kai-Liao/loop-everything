@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Ying-Kai-Liao/loop-everything/schema/loop.schema.json",
+  "title": "loops/loop.yml — per-repo facts for the loop-everything v2 hub",
+  "type": "object",
+  "required": ["version", "human", "required_check", "verify"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 2,
+      "description": "Contract version. This schema describes version 2."
+    },
+    "human": {
+      "type": "string",
+      "pattern": "^@[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$",
+      "description": "GitHub handle to @mention on interrupts (loop-waiting / loop-needs-human / loop-ops). @mentions notify; labels don't."
+    },
+    "required_check": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Branch-protection check name the harness snapshots and the merge rule requires green."
+    },
+    "branch_prefix": {
+      "type": "string",
+      "default": "loop/",
+      "minLength": 1,
+      "description": "Loop branch prefix; scopes the agent token's push permission."
+    },
+    "model": {
+      "type": "string",
+      "default": "claude-sonnet-4-6",
+      "description": "Model for the main loop."
+    },
+    "max_turns": {
+      "type": "integer",
+      "default": 150,
+      "minimum": 1,
+      "description": "Claude Code --max-turns for one wake."
+    },
+    "lanes": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "default": { "type": "integer", "minimum": 1, "default": 1 },
+        "max": { "type": "integer", "minimum": 1, "default": 4 }
+      },
+      "description": "Parallel-lane policy: default when the caller doesn't say, hard cap always."
+    },
+    "setup": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": [],
+      "description": "Shell commands run in the spoke checkout before the agent starts (installs, prereq builds — e.g. Nina's pnpm install + shared package builds). The runner's toolchain must already provide the interpreters/tools these commands need."
+    },
+    "verify": {
+      "type": "object",
+      "required": ["L0"],
+      "propertyNames": { "pattern": "^L[0-9]+$" },
+      "additionalProperties": { "type": "string" },
+      "description": "The verifier ladder, concretely: level -> shell command. L0 is required."
+    },
+    "serial_paths": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": [],
+      "description": "Glob list — units touching these are lane-0-only, one at a time."
+    },
+    "blind_spots": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "required": ["paths", "require_status"],
+        "additionalProperties": false,
+        "properties": {
+          "paths": {
+            "type": "array",
+            "items": { "type": "string" },
+            "minItems": 1
+          },
+          "require_status": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Commit-status context substring (case-insensitive) that must be green to merge PRs touching `paths`."
+          }
+        }
+      },
+      "description": "Extra merge guards: CI passes but doesn't prove it (e.g. web/** needs the Vercel status; Nina #191/#195)."
+    },
+    "invariants": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": [],
+      "description": "Repo 'must not break' rules, injected verbatim into the wake prompt."
+    },
+    "network": {
+      "type": "string",
+      "enum": ["none", "github", "open"],
+      "default": "none",
+      "description": "Agent network policy. `none` routes web-needing units to loop-needs-human instead of shipping degraded fallbacks."
+    },
+    "escalation": {
+      "type": "object",
+      "required": ["agent", "label"],
+      "additionalProperties": false,
+      "properties": {
+        "agent": { "type": "string", "minLength": 1 },
+        "label": { "type": "string", "minLength": 1 }
+      },
+      "description": "Optional smart-model tag-in agent and the issue label that forces the route. Omit if the repo has no escalation agent."
+    },
+    "allowed_tools_extra": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": [],
+      "description": "Extra Claude Code allowedTools entries appended to the hub base list (e.g. Bash(pnpm install:*))."
+    },
+    "registry": {
+      "type": ["string", "null"],
+      "default": null,
+      "description": "Optional path to a loops/README.md-style registry; omit for ticket-only repos."
+    }
+  }
+}
