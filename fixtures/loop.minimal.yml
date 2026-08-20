@@ -1,0 +1,6 @@
+# Minimal valid loops/loop.yml — everything else takes contract defaults.
+version: 2
+human: "@Ying-Kai-Liao"
+required_check: validate
+verify:
+  L0: "true"
